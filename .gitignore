@@ -1,0 +1,17 @@
+# Compiled binaries
+/bin/
+inference-scheduler
+
+# Go workspace files (if used locally)
+go.work
+go.work.sum
+
+# Editor and IDE directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS-generated files
+.DS_Store
+Thumbs.db
