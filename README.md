@@ -18,10 +18,10 @@ Where `G_P` / `G_D` are the active prefill / decode pods and `m_P` / `m_D` are t
 - Go 1.25+
 - The `InferenceJob` CRD (`inference.example.com/v1alpha1`) applied to the cluster
 
-Apply the CRD before running the scheduler:
+Apply the CRD before running the scheduler. The CRD is defined in the `controller-scaling` components:
 
 ```bash
-kubectl apply -f config/crd/inferencejob_crd.yaml
+kubectl apply -f ../controller-scaling/config/crd/inferencejob_crd.yaml
 ```
 
 ---
