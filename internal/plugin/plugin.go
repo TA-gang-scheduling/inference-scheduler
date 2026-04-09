@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -93,6 +94,18 @@ var _ framework.ReservePlugin = &InferenceSchedulerPlugin{}
 var _ framework.PermitPlugin = &InferenceSchedulerPlugin{}
 var _ framework.PostBindPlugin = &InferenceSchedulerPlugin{}
 
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
+func addKnownTypes(s *runtime.Scheme) error {
+	gv := schema.GroupVersion{Group: "inference.example.com", Version: "v1alpha1"}
+	s.AddKnownTypes(gv, &InferenceJob{}, &InferenceJobList{})
+	metav1.AddToGroupVersion(s, gv)
+	return nil
+}
+
 // ─────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────
@@ -103,11 +116,15 @@ func New(_ context.Context, _ runtime.Object, h framework.Handle) (framework.Plu
 		return nil, fmt.Errorf("getting kubeconfig: %w", err)
 	}
 
-	scheme := runtime.NewScheme()
-	GroupVersion := schema.GroupVersion{Group: "inference.example.com", Version: "v1alpha1"}
-	scheme.AddKnownTypes(GroupVersion, &InferenceJob{}, &InferenceJobList{})
+	s := runtime.NewScheme()
+	if err := scheme.AddToScheme(s); err != nil {
+		return nil, fmt.Errorf("adding standard scheme: %w", err)
+	}
+	if err := AddToScheme(s); err != nil {
+		return nil, fmt.Errorf("adding custom scheme: %w", err)
+	}
 
-	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	c, err := client.New(cfg, client.Options{Scheme: s})
 	if err != nil {
 		return nil, fmt.Errorf("creating controller-runtime client: %w", err)
 	}
