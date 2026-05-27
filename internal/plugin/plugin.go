@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kube-scheduler/framework"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -75,9 +75,10 @@ func (ijl *InferenceJobList) DeepCopyObject() runtime.Object {
 // ─────────────────────────────────────────────
 
 type gangState struct {
-	mu           sync.Mutex
-	prefillReady int32
-	decodeReady  int32
+	mu              sync.Mutex
+	reservedPods    map[types.UID]string
+	prefillReserved int32
+	decodeReserved  int32
 }
 
 type InferenceSchedulerPlugin struct {
@@ -88,7 +89,7 @@ type InferenceSchedulerPlugin struct {
 	groups map[string]*gangState
 }
 
-// Compile-time interface checks (Unreserve is part of ReservePlugin in v1.30)
+// Compile-time interface checks (Unreserve is part of ReservePlugin).
 var _ framework.PreFilterPlugin = &InferenceSchedulerPlugin{}
 var _ framework.ReservePlugin = &InferenceSchedulerPlugin{}
 var _ framework.PermitPlugin = &InferenceSchedulerPlugin{}
@@ -140,11 +141,53 @@ func New(_ context.Context, _ runtime.Object, h framework.Handle) (framework.Plu
 
 func (p *InferenceSchedulerPlugin) Name() string { return Name }
 
+func newGangState() *gangState {
+	return &gangState{
+		reservedPods: make(map[types.UID]string),
+	}
+}
+
+func (p *InferenceSchedulerPlugin) getGroup(groupKey string) *gangState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	g, ok := p.groups[groupKey]
+	if !ok {
+		g = newGangState()
+		p.groups[groupKey] = g
+	} else if g.reservedPods == nil {
+		g.reservedPods = make(map[types.UID]string)
+	}
+
+	return g
+}
+
+func (p *InferenceSchedulerPlugin) getMinima(ctx context.Context, pod *v1.Pod) (int32, int32, *framework.Status) {
+	jobName := pod.Labels[LabelJob]
+
+	var job InferenceJob
+	if err := p.client.Get(ctx, types.NamespacedName{Name: jobName, Namespace: pod.Namespace}, &job); err != nil {
+		return 0, 0, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+	}
+
+	minPrefill := job.Spec.MinPrefillReplicas
+	if minPrefill < 1 {
+		minPrefill = 1
+	}
+
+	minDecode := job.Spec.MinDecodeReplicas
+	if minDecode < 1 {
+		minDecode = 1
+	}
+
+	return minPrefill, minDecode, framework.NewStatus(framework.Success)
+}
+
 // ─────────────────────────────────────────────
 // PreFilter
 // ─────────────────────────────────────────────
 
-func (p *InferenceSchedulerPlugin) PreFilter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+func (p *InferenceSchedulerPlugin) PreFilter(ctx context.Context, _ framework.CycleState, pod *v1.Pod, _ []framework.NodeInfo) (*framework.PreFilterResult, *framework.Status) {
 	jobName, hasJob := pod.Labels[LabelJob]
 	role, hasRole := pod.Labels[LabelRole]
 
@@ -172,33 +215,51 @@ func (p *InferenceSchedulerPlugin) PreFilterExtensions() framework.PreFilterExte
 // Reserve & Unreserve
 // ─────────────────────────────────────────────
 
-func (p *InferenceSchedulerPlugin) Reserve(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, _ string) *framework.Status {
-	jobName := pod.Labels[LabelJob]
-	role := pod.Labels[LabelRole]
+func (p *InferenceSchedulerPlugin) Reserve(ctx context.Context, _ framework.CycleState, pod *v1.Pod, _ string) *framework.Status {
+	jobName, hasJob := pod.Labels[LabelJob]
+	role, hasRole := pod.Labels[LabelRole]
+
+	if !hasJob || !hasRole {
+		return framework.NewStatus(framework.Success)
+	}
+
 	groupKey := pod.Namespace + "/" + jobName
 
-	p.mu.Lock()
-	g, ok := p.groups[groupKey]
-	if !ok {
-		g = &gangState{}
-		p.groups[groupKey] = g
+	minPrefill, minDecode, status := p.getMinima(ctx, pod)
+	if !status.IsSuccess() {
+		return status
 	}
-	p.mu.Unlock()
 
+	g := p.getGroup(groupKey)
 	g.mu.Lock()
-	if role == RolePrefill {
-		g.prefillReady++
-	} else if role == RoleDecode {
-		g.decodeReady++
+	defer g.mu.Unlock()
+
+	if _, ok := g.reservedPods[pod.UID]; ok {
+		return framework.NewStatus(framework.Success)
 	}
-	g.mu.Unlock()
+
+	switch role {
+	case RolePrefill:
+		if g.prefillReserved >= minPrefill {
+			klog.InfoS("Reserve: role quota full", "pod", klog.KObj(pod), "job", groupKey, "role", role, "reserved", g.prefillReserved, "min", minPrefill)
+			return framework.NewStatus(framework.Unschedulable, "prefill quorum already reserved for this wave")
+		}
+		g.reservedPods[pod.UID] = role
+		g.prefillReserved++
+	case RoleDecode:
+		if g.decodeReserved >= minDecode {
+			klog.InfoS("Reserve: role quota full", "pod", klog.KObj(pod), "job", groupKey, "role", role, "reserved", g.decodeReserved, "min", minDecode)
+			return framework.NewStatus(framework.Unschedulable, "decode quorum already reserved for this wave")
+		}
+		g.reservedPods[pod.UID] = role
+		g.decodeReserved++
+	}
 
 	return framework.NewStatus(framework.Success)
 }
 
-func (p *InferenceSchedulerPlugin) Unreserve(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, _ string) {
+func (p *InferenceSchedulerPlugin) Unreserve(ctx context.Context, _ framework.CycleState, pod *v1.Pod, _ string) {
 	jobName := pod.Labels[LabelJob]
-	role := pod.Labels[LabelRole]
 	groupKey := pod.Namespace + "/" + jobName
 
 	p.mu.Lock()
@@ -207,10 +268,13 @@ func (p *InferenceSchedulerPlugin) Unreserve(ctx context.Context, _ *framework.C
 
 	if ok {
 		g.mu.Lock()
-		if role == RolePrefill && g.prefillReady > 0 {
-			g.prefillReady--
-		} else if role == RoleDecode && g.decodeReady > 0 {
-			g.decodeReady--
+		if role, reserved := g.reservedPods[pod.UID]; reserved {
+			if role == RolePrefill && g.prefillReserved > 0 {
+				g.prefillReserved--
+			} else if role == RoleDecode && g.decodeReserved > 0 {
+				g.decodeReserved--
+			}
+			delete(g.reservedPods, pod.UID)
 		}
 		g.mu.Unlock()
 	}
@@ -220,53 +284,47 @@ func (p *InferenceSchedulerPlugin) Unreserve(ctx context.Context, _ *framework.C
 // Permit
 // ─────────────────────────────────────────────
 
-func (p *InferenceSchedulerPlugin) Permit(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, _ string) (*framework.Status, time.Duration) {
-	jobName := pod.Labels[LabelJob]
-	groupKey := pod.Namespace + "/" + jobName
-
-	var job InferenceJob
-	if err := p.client.Get(ctx, types.NamespacedName{Name: jobName, Namespace: pod.Namespace}, &job); err != nil {
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error()), 0
-	}
-
-	minPrefill := job.Spec.MinPrefillReplicas
-	if minPrefill < 1 { minPrefill = 1 }
-	minDecode := job.Spec.MinDecodeReplicas
-	if minDecode < 1 { minDecode = 1 }
-
-	p.mu.Lock()
-	g, ok := p.groups[groupKey]
-	if !ok {
-		g = &gangState{}
-		p.groups[groupKey] = g
-	}
-	p.mu.Unlock()
-
-	g.mu.Lock()
-	currentPrefill := g.prefillReady
-	currentDecode := g.decodeReady
-	g.mu.Unlock()
-
-	// Condition met: release all waiting pods for this job
-	if currentPrefill >= minPrefill && currentDecode >= minDecode {
-		klog.InfoS("Permit: gang released", "job", groupKey, "prefillReady", currentPrefill, "decodeReady", currentDecode)
-		
-		p.handle.IterateOverWaitingPods(func(wp framework.WaitingPod) {
-			if wp.GetPod().Labels[LabelJob] == jobName {
-				wp.Allow(Name)
-			}
-		})
-		
-		// Reset counters for the next wave
-		g.mu.Lock()
-		g.prefillReady = 0
-		g.decodeReady = 0
-		g.mu.Unlock()
-		
+func (p *InferenceSchedulerPlugin) Permit(ctx context.Context, _ framework.CycleState, pod *v1.Pod, _ string) (*framework.Status, time.Duration) {
+	jobName, hasJob := pod.Labels[LabelJob]
+	if !hasJob {
 		return framework.NewStatus(framework.Success), 0
 	}
 
-	klog.V(2).InfoS("Permit: holding pod", "pod", klog.KObj(pod), "job", groupKey)
+	groupKey := pod.Namespace + "/" + jobName
+
+	minPrefill, minDecode, status := p.getMinima(ctx, pod)
+	if !status.IsSuccess() {
+		return status, 0
+	}
+
+	g := p.getGroup(groupKey)
+	g.mu.Lock()
+	currentPrefill := g.prefillReserved
+	currentDecode := g.decodeReserved
+
+	if currentPrefill >= minPrefill && currentDecode >= minDecode {
+		klog.InfoS("Permit: gang released", "job", groupKey, "prefillReady", currentPrefill, "decodeReady", currentDecode)
+
+		releasePods := make(map[types.UID]struct{}, len(g.reservedPods))
+		for uid := range g.reservedPods {
+			releasePods[uid] = struct{}{}
+		}
+		g.reservedPods = make(map[types.UID]string)
+		g.prefillReserved = 0
+		g.decodeReserved = 0
+		g.mu.Unlock()
+
+		p.handle.IterateOverWaitingPods(func(wp framework.WaitingPod) {
+			if _, ok := releasePods[wp.GetPod().UID]; ok {
+				wp.Allow(Name)
+			}
+		})
+
+		return framework.NewStatus(framework.Success), 0
+	}
+	g.mu.Unlock()
+
+	klog.V(2).InfoS("Permit: holding pod", "pod", klog.KObj(pod), "job", groupKey, "prefillReady", currentPrefill, "decodeReady", currentDecode, "minPrefill", minPrefill, "minDecode", minDecode)
 	return framework.NewStatus(framework.Wait), PermitTimeout
 }
 
@@ -274,7 +332,7 @@ func (p *InferenceSchedulerPlugin) Permit(ctx context.Context, _ *framework.Cycl
 // PostBind
 // ─────────────────────────────────────────────
 
-func (p *InferenceSchedulerPlugin) PostBind(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, _ string) {
+func (p *InferenceSchedulerPlugin) PostBind(ctx context.Context, _ framework.CycleState, pod *v1.Pod, _ string) {
 	jobName := pod.Labels[LabelJob]
 	key := types.NamespacedName{Name: jobName, Namespace: pod.Namespace}
 
