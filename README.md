@@ -15,7 +15,7 @@ Where `G_P` / `G_D` are the active prefill / decode pods and `m_P` / `m_D` are t
 ## Prerequisites
 
 - Kubernetes v1.30 cluster
-- Go 1.25+
+- Go 1.26+
 - The `InferenceJob` CRD (`inference.example.com/v1alpha1`) applied to the cluster
 
 Apply the CRD before running the scheduler. The CRD is defined in the `controller-scaling` components:

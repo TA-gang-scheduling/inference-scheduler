@@ -2,6 +2,9 @@
 /bin/
 inference-scheduler
 
+# Local Go build cache
+.gocache/
+
 # Go workspace files (if used locally)
 go.work
 go.work.sum
